@@ -474,3 +474,76 @@ try:
 except Exception as _e:
     st.caption(f"Indicators panel: {_e}")
 # ============================================================================#
+# ==== REBUILD HOT CONSOLIDATION (DROP-IN REPLACEMENT) =======================
+import re, numpy as np, pandas as pd
+
+COLD_NAMES = {"TREZOR", "HODL", "VAULT", "COLD", "TREZOR/VAULT"}
+
+def _money(x):
+    s = str(x).strip()
+    if s in ("", "nan", "None", "—", "-", "null"): 
+        return np.nan
+    try:
+        # quita $, comas, espacios; respeta signo y punto decimal
+        s = re.sub(r"[^\d\.\-]", "", s)
+        return float(s)
+    except Exception:
+        return np.nan
+
+def rebuild_hot_consolidation(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Consolida SOLO HOT con limpieza robusta y fallback de Used Price:
+      Used Price = Price(USD) si existe → Avg Cost(USD) → 0.0
+    Calcula Current Value, P&L, P&L%, %Portfolio.
+    """
+    df = df_raw.copy()
+
+    # columnas mínimas
+    needed = ["Symbol","Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)","Wallet"]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # limpieza numérica
+    for c in ["Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)"]:
+        df[c] = df[c].apply(_money)
+
+    # HOT = todo lo que NO esté marcado como COLD
+    wallet_upper = df["Wallet"].fillna("").astype(str).str.upper()
+    hot = df[~wallet_upper.isin(COLD_NAMES)].copy()
+
+    # Used Price robusto (NO usa Total Cost)
+    used_price = hot["Price (USD)"]
+    used_price = used_price.where(used_price.notna(), hot["Avg Cost (USD)"])
+    used_price = used_price.fillna(0.0)
+
+    hot["Used Price (USD)"] = used_price
+    hot["Current Value (USD)"] = (hot["Quantity"].fillna(0.0) * hot["Used Price (USD)"]).fillna(0.0)
+
+    # groupby por símbolo
+    g = (
+        hot.groupby("Symbol", dropna=True, as_index=False)
+           .agg({
+               "Quantity": "sum",
+               "Total Cost (USD)": "sum",
+               "Used Price (USD)": "last",     # último precio usado
+               "Current Value (USD)": "sum"
+           })
+    )
+
+    # avg cost, P&L, P&L%, %Portfolio
+    g["Avg Cost (USD)"] = np.where(g["Quantity"]>0, g["Total Cost (USD)"]/g["Quantity"], np.nan)
+    g["P&L (USD)"] = g["Current Value (USD)"] - g["Total Cost (USD)"]
+    g["P&L %"] = np.where(g["Total Cost (USD)"]>0, 100*g["P&L (USD)"]/g["Total Cost (USD)"], 0.0)
+    tot = float(g["Current Value (USD)"].sum())
+    g["% Portfolio"] = np.where(tot>0, 100*g["Current Value (USD)"]/tot, 0.0)
+
+    # sanity check: posibles “usos de precio” sospechosos
+    suspicious = g[(g["Avg Cost (USD)"].notna()) & (g["Used Price (USD)"] > 50 * g["Avg Cost (USD)"])]
+    if len(suspicious) > 0:
+        import streamlit as st
+        with st.expander("⚠️ Sanity check (posibles Used Price anómalos)"):
+            st.dataframe(suspicious, use_container_width=True)
+
+    return g
+# ===========================================================================#
