@@ -247,3 +247,54 @@ async def multi_indicators(symbols: str, limit: int = 250, x_api_key: str | None
             errors[s] = str(e)
 
     return JSONResponse({"data": out, "errors": errors})
+    
+# === OCO SUGGEST (DROP-IN, PEGAR AL FINAL DE app.py) =========================
+from fastapi import Header
+
+def _tick(price: float) -> float:
+    """
+    Redondeo de 'tick' simple por escala de precio:
+      >=1000 → 1 dec; >=100 → 2 dec; >=10 → 3 dec; <10 → 4 dec
+    """
+    p = abs(float(price))
+    dec = 1 if p >= 1000 else 2 if p >= 100 else 3 if p >= 10 else 4
+    return round(float(price), dec)
+
+def _oco_from_close(close: float, atr: float, k: float, R: float, risk_usd: float) -> dict:
+    """
+    Reglas por defecto:
+      stop = close - k*ATR20
+      take = close + R*ATR20
+      qty  = riesgo_usd / (close - stop)
+    """
+    close = float(close); atr = float(atr); k = float(k); R = float(R); risk_usd = float(risk_usd)
+    stop = close - k * atr
+    take = close + R * atr
+    denom = max(close - stop, 1e-12)
+    qty = max(risk_usd / denom, 0.0)
+    out = {"stop": _tick(stop), "take": _tick(take), "qty": _tick(qty)}
+    if not (out["take"] > out["stop"]):
+        raise HTTPException(status_code=422, detail="Invalid OCO (take <= stop)")
+    return out
+
+@app.get("/oco_suggest")
+async def oco_suggest(symbol: str,
+                      k: float = 1.2,
+                      R: float = 2.0,
+                      risk_usd: float = 100.0,
+                      limit: int = 250,
+                      x_api_key: str | None = Header(default=None)):
+    """
+    Devuelve stop/take/qty (1D) usando la última vela y ATR20 interno.
+    Requiere header x-api-key (igual que /multi_indicators y /ohlc).
+    """
+    _verify_key(x_api_key)
+    ohlc = await fetch_klines(symbol, limit)
+    closes = [c["c"] for c in ohlc]
+    if not closes:
+        raise HTTPException(status_code=502, detail="No close data")
+    close = float(closes[-1])
+    atr20 = float(_atr20(ohlc))
+    res = _oco_from_close(close, atr20, k, R, risk_usd)
+    return {"symbol": symbol.upper(), "close": close, "atr20": atr20, **res}
+# ============================================================================#
