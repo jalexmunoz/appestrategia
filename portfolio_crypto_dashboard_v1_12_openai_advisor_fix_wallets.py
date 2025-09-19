@@ -416,3 +416,61 @@ with colR:
             st.markdown(openai_advice(ctx))
     else:
         st.caption("Activa 'Usar OpenAI...' para generar un plan con tu API key.")
+
+# === INDICATORS PANEL (DROP-IN, PEGAR AL FINAL DEL DASHBOARD) ================
+import requests
+
+@st.cache_data(ttl=60*10, show_spinner=False)
+def _indicators_multi(symbols: list[str], api_host: str, api_key: str, limit: int = 250) -> dict:
+    if not symbols: return {}
+    url = f"{api_host.rstrip('/')}/multi_indicators"
+    headers = {"x-api-key": api_key}
+    q = ",".join(symbols)
+    r = requests.get(url, headers=headers, params={"symbols": q, "limit": limit}, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    return js.get("data", {}) if isinstance(js, dict) else {}
+
+def _render_indicators_panel():
+    api_host = st.secrets.get("API_HOST", os.getenv("API_HOST", "https://appestrategia.onrender.com"))
+    api_key  = st.secrets.get("API_KEY",  os.getenv("API_KEY", ""))
+    st.markdown("---")
+    st.subheader("📊 Indicators (HOT • Micro-API)")
+    if not api_key:
+        st.info("Configura API_KEY (Secrets o Environment) para consultar tu Micro-API.")
+        return
+    try:
+        syms = [s for s in cons["Symbol"].dropna().unique().tolist() if s]
+    except Exception:
+        st.warning("No HOT table found (variable 'cons').")
+        return
+
+    data = _indicators_multi(syms, api_host, api_key)
+    if not data:
+        st.caption("Sin indicadores (Micro-API no respondió o sin datos).")
+        return
+
+    rows = []
+    for s in syms:
+        d = data.get(s) or {}
+        rows.append({
+            "Symbol": s,
+            "Close": d.get("close"),
+            "SMA50": d.get("sma50"),
+            "SMA200": d.get("sma200"),
+            "ATR20": d.get("atr20"),
+            "↑SMA50": d.get("above_sma50"),
+            "↑SMA200": d.get("above_sma200"),
+        })
+    tbl = pd.DataFrame(rows)
+    st.dataframe(
+        tbl.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis='index'),
+        use_container_width=True, height=260
+    )
+
+# Auto-render del panel al final del script
+try:
+    _render_indicators_panel()
+except Exception as _e:
+    st.caption(f"Indicators panel: {_e}")
+# ============================================================================#
