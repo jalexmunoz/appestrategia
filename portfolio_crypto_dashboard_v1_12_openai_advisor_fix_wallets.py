@@ -10,6 +10,31 @@ try:
     load_dotenv()
 except Exception:
     pass
+    
+    # === SECRETS SHIM: evita StreamlitSecretNotFoundError =========================
+import os
+try:
+    import streamlit as st
+
+    class _SecretsShim:
+        def get(self, key, default=None):
+            v = os.getenv(key)
+            return v if (v is not None and str(v).strip() != "") else default
+        def __getitem__(self, key):
+            v = os.getenv(key)
+            if v is None:
+                raise KeyError(key)
+            return v
+
+    # Si acceder a st.secrets falla (no hay secrets.toml), inyectamos el shim.
+    try:
+        _ = st.secrets.get("__probe__", None)  # fuerza el parse interno
+    except Exception:
+        st.secrets = _SecretsShim()
+except Exception:
+    pass
+# ============================================================================== 
+
 
 st.set_page_config(page_title="Crypto Dashboard — v1.12 · OpenAI Advisor", layout="wide")
 
@@ -417,12 +442,12 @@ with colR:
     else:
         st.caption("Activa 'Usar OpenAI...' para generar un plan con tu API key.")
 
-# === INDICATORS PANEL (DROP-IN, PEGAR AL FINAL DEL DASHBOARD) ================
-import requests
+# ==== CONSOLIDATED (HOT) + INDICATORS PANEL (DROP-IN REPLACEMENT) ===========
+import requests, os, streamlit as st
 
-@st.cache_data(ttl=60*10, show_spinner=False)
-def _indicators_multi(symbols: list[str], api_host: str, api_key: str, limit: int = 250) -> dict:
-    if not symbols: return {}
+def _fetch_indicators_multi(symbols, api_host, api_key, limit=250):
+    if not symbols:
+        return {}
     url = f"{api_host.rstrip('/')}/multi_indicators"
     headers = {"x-api-key": api_key}
     q = ",".join(symbols)
@@ -431,27 +456,44 @@ def _indicators_multi(symbols: list[str], api_host: str, api_key: str, limit: in
     js = r.json()
     return js.get("data", {}) if isinstance(js, dict) else {}
 
-def _render_indicators_panel():
+def render_hot_and_indicators(cons_df: pd.DataFrame):
+    st.markdown("### Consolidated — Trading (HOT only)")
+    st.dataframe(
+        cons_df.style.format({
+            "Avg Cost (USD)":"${:,.2f}",
+            "Used Price (USD)":"${:,.2f}",
+            "Current Value (USD)":"${:,.2f}",
+            "Total Cost (USD)":"${:,.2f}",
+            "P&L (USD)":"${:,.2f}",
+            "P&L %":"{:,.2f}%",
+            "% Portfolio":"{:,.2f}%"
+        }).hide(axis="index"),
+        use_container_width=True, height=360
+    )
+
+    st.markdown("---")
+    st.header("📊 Indicators (HOT • Micro-API)")
+
     api_host = st.secrets.get("API_HOST", os.getenv("API_HOST", "https://appestrategia.onrender.com"))
     api_key  = st.secrets.get("API_KEY",  os.getenv("API_KEY", ""))
-    st.markdown("---")
-    st.subheader("📊 Indicators (HOT • Micro-API)")
+
     if not api_key:
-        st.info("Configura API_KEY (Secrets o Environment) para consultar tu Micro-API.")
-        return
-    try:
-        syms = [s for s in cons["Symbol"].dropna().unique().tolist() if s]
-    except Exception:
-        st.warning("No HOT table found (variable 'cons').")
+        st.info("Configura API_KEY en el servicio del dashboard (Render → Settings → Environment).")
         return
 
-    data = _indicators_multi(syms, api_host, api_key)
+    symbols = cons_df["Symbol"].dropna().astype(str).unique().tolist()
+    try:
+        data = _fetch_indicators_multi(symbols, api_host, api_key, limit=250)
+    except Exception as e:
+        st.error(f"No fue posible consultar indicadores: {e}")
+        return
+
     if not data:
         st.caption("Sin indicadores (Micro-API no respondió o sin datos).")
         return
 
     rows = []
-    for s in syms:
+    for s in symbols:
         d = data.get(s) or {}
         rows.append({
             "Symbol": s,
@@ -462,45 +504,382 @@ def _render_indicators_panel():
             "↑SMA50": d.get("above_sma50"),
             "↑SMA200": d.get("above_sma200"),
         })
-    tbl = pd.DataFrame(rows)
+    ind_tbl = pd.DataFrame(rows)
     st.dataframe(
-        tbl.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis='index'),
+        ind_tbl.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis="index"),
         use_container_width=True, height=260
     )
+
+# === Llamada única (garantiza que se pinte ANTES de cualquier st.stop()) ====
+render_hot_and_indicators(cons)
+# ===========================================================================#
+
 
 # Auto-render del panel al final del script
 try:
     _render_indicators_panel()
 except Exception as _e:
     st.caption(f"Indicators panel: {_e}")
-# ============================================================================#
-# ==== REBUILD HOT CONSOLIDATION (DROP-IN REPLACEMENT) =======================
-import re, numpy as np, pandas as pd
+# ==================== CONSOLIDATED (HOT) + INDICATORS — OVERRIDE ====================
+import os, re, numpy as np, pandas as pd, requests, streamlit as st
 
 COLD_NAMES = {"TREZOR", "HODL", "VAULT", "COLD", "TREZOR/VAULT"}
+
+def _get_env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v if (v is not None and str(v).strip() != "") else default
+
+def _df_stretch(df_or_style, height: int = 320):
+    try:
+        st.dataframe(df_or_style, height=height, width="stretch")
+    except TypeError:
+        st.dataframe(df_or_style, height=height, use_container_width=True)
 
 def _money(x):
     s = str(x).strip()
     if s in ("", "nan", "None", "—", "-", "null"): 
         return np.nan
     try:
-        # quita $, comas, espacios; respeta signo y punto decimal
-        s = re.sub(r"[^\d\.\-]", "", s)
-        return float(s)
+        s = re.sub(r"[^\d\.\-]", "", s)  # quita $, comas, espacios
+        return float(s) if s not in ("", ".", "-", "-.") else np.nan
     except Exception:
         return np.nan
 
 def rebuild_hot_consolidation(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Consolida SOLO HOT con limpieza robusta y fallback de Used Price:
-      Used Price = Price(USD) si existe → Avg Cost(USD) → 0.0
-    Calcula Current Value, P&L, P&L%, %Portfolio.
+    Reconstruye HOT con limpieza robusta y corrige Total Cost si luce anómalo.
+    Used Price = Price (USD) si hay → Avg Cost (USD) → 0.0
+    Total Cost sanity: si es >> Quantity * precio_plausible, se recalcula.
     """
+    df = df_raw.copy()
+    need = ["Symbol","Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)","Wallet"]
+    for c in need:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # Limpieza numérica
+    for c in ["Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)"]:
+        df[c] = df[c].apply(_money)
+
+    # HOT = no COLD
+    wallet_up = df["Wallet"].fillna("").astype(str).str.upper()
+    hot = df[~wallet_up.isin(COLD_NAMES)].copy()
+
+    # Precio usado
+    used_price = hot["Price (USD)"]
+    used_price = used_price.where(used_price.notna(), hot["Avg Cost (USD)"])
+    used_price = used_price.fillna(0.0)
+    hot["Used Price (USD)"] = used_price
+
+    # ---- Sanity para Total Cost: corrige outliers groseros por símbolo/row ----
+    # precio plausible por row
+    plausible = hot["Avg Cost (USD)"].where(hot["Avg Cost (USD)"].notna(), hot["Used Price (USD)"])
+    plausible = plausible.where(plausible.notna() & (plausible > 0), hot["Used Price (USD)"].replace(0, np.nan))
+    # recomputa costo por row si el declarado es muy alto (umbral x100 del plausible*qty)
+    row_total = hot["Total Cost (USD)"]
+    recomputed = hot["Quantity"].fillna(0) * plausible.fillna(0)
+    too_high = (row_total.notna()) & (recomputed.notna()) & (row_total > 100 * np.maximum(recomputed, 1.0))
+    row_total = np.where(too_high | row_total.isna(), recomputed, row_total)
+    hot["Total Cost (USD)"] = pd.to_numeric(row_total, errors="coerce").fillna(0.0)
+
+    hot["Current Value (USD)"] = (hot["Quantity"].fillna(0.0) * hot["Used Price (USD)"]).fillna(0.0)
+
+    g = (
+        hot.groupby("Symbol", dropna=True, as_index=False)
+           .agg({
+               "Quantity": "sum",
+               "Total Cost (USD)": "sum",
+               "Used Price (USD)": "last",
+               "Current Value (USD)": "sum"
+           })
+    )
+    g["Avg Cost (USD)"] = np.where(g["Quantity"]>0, g["Total Cost (USD)"]/g["Quantity"], np.nan)
+    g["P&L (USD)"] = g["Current Value (USD)"] - g["Total Cost (USD)"]
+    g["P&L %"] = np.where(g["Total Cost (USD)"]>0, 100*g["P&L (USD)"]/g["Total Cost (USD)"], 0.0)
+    tot = float(g["Current Value (USD)"].sum())
+    g["% Portfolio"] = np.where(tot>0, 100*g["Current Value (USD)"]/tot, 0.0)
+
+    # Sanity panel: muestra outliers todavía raros (p.ej. Avg Cost muy alto frente a Used)
+    suspicious = g[(g["Avg Cost (USD)"].notna()) & (g["Used Price (USD)"].notna()) &
+                   (g["Avg Cost (USD)"] > 50 * g["Used Price (USD)"])]
+    if len(suspicious) > 0:
+        with st.expander("⚠️ Sanity check — posibles costos anómalos"):
+            _df_stretch(suspicious.style.format({
+                "Avg Cost (USD)":"${:,.4f}","Used Price (USD)":"${:,.4f}",
+                "Total Cost (USD)":"${:,.2f}","Current Value (USD)":"${:,.2f}"
+            }).hide(axis="index"), height=220)
+    return g
+
+def render_hot_and_indicators(cons_source: pd.DataFrame):
+    """
+    Dibuja HOT consolidado (con corrección previa) + Indicators usando la Micro-API.
+    NO usa st.secrets. Lee API_HOST/API_KEY de entorno.
+    """
+    # Intenta reutilizar df global si existe para reconstruir HOT
+    base_df = None
+    for name in ("df","df_positions","positions_df","df_all","data","data_df"):
+        if name in globals():
+            obj = globals()[name]
+            try:
+                if isinstance(obj, pd.DataFrame):
+                    base_df = obj
+                    break
+            except Exception:
+                pass
+    cons = rebuild_hot_consolidation(base_df) if base_df is not None else cons_source.copy()
+
+    st.subheader("Consolidated — Trading (HOT only)")
+    tbl = cons[[
+        "Symbol","Quantity","Avg Cost (USD)","Used Price (USD)",
+        "Current Value (USD)","P&L (USD)","P&L %","% Portfolio"
+    ]].sort_values("Current Value (USD)", ascending=False)
+    style = tbl.style.format({
+        "Quantity":"{:.8f}","Avg Cost (USD)":"${:,.4f}","Used Price (USD)":"${:,.4f}",
+        "Current Value (USD)":"${:,.2f}","P&L (USD)":"${:,.2f}","P&L %":"{:.2f}%","% Portfolio":"{:.2f}%"
+    }).hide(axis="index")
+    _df_stretch(style, height=360)
+
+    st.markdown("---")
+    st.header("📊 Indicators (HOT • Micro-API)")
+
+    api_host = _get_env("API_HOST", "https://appestrategia.onrender.com")
+    api_key  = _get_env("API_KEY", "")
+
+    if not api_key:
+        st.info("Falta API_KEY en variables de entorno (local) o Environment (Render).")
+        return
+
+    symbols = cons["Symbol"].dropna().astype(str).unique().tolist()
+    if not symbols:
+        st.caption("No hay símbolos HOT para consultar.")
+        return
+
+    try:
+        url = f"{api_host.rstrip('/')}/multi_indicators"
+        headers = {"x-api-key": api_key}
+        r = requests.get(url, headers=headers, params={"symbols": ",".join(symbols), "limit": 250}, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    except Exception as e:
+        st.error(f"No fue posible consultar indicadores: {e}")
+        return
+
+    if not data:
+        st.caption("Sin indicadores (Micro-API no respondió o sin datos).")
+        return
+
+    rows = []
+    for s in symbols:
+        d = data.get(s) or {}
+        rows.append({
+            "Symbol": s,
+            "Close": d.get("close"),
+            "SMA50": d.get("sma50"),
+            "SMA200": d.get("sma200"),
+            "ATR20": d.get("atr20"),
+            "↑SMA50": d.get("above_sma50"),
+            "↑SMA200": d.get("above_sma200"),
+        })
+    ind_tbl = pd.DataFrame(rows)
+    style2 = ind_tbl.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis="index")
+    _df_stretch(style2, height=260)
+
+# === llamada única (misma firma que tu llamada anterior) ===
+render_hot_and_indicators(cons)
+# ==========================================================================================
+
+    # ===================== PATCH V2 — SAFE ENV + KPIs + WALLET + INDICATORS =====================
+import os, requests
+
+def _get_env_or_default(key: str, default: str = "") -> str:
+    """
+    Lee primero de variables de entorno; si no hay, devuelve default.
+    NO toca st.secrets para evitar StreamlitSecretNotFoundError en local.
+    """
+    val = os.getenv(key)
+    return val if (val is not None and str(val).strip() != "") else default
+
+def _df_stretch(df_style_or_df, height: int = 320):
+    """
+    Renderiza un dataframe usando width='stretch' si la versión de Streamlit lo soporta.
+    Si no, cae a use_container_width=True para compatibilidad.
+    """
+    try:
+        st.dataframe(df_style_or_df, height=height, width="stretch")
+    except TypeError:
+        st.dataframe(df_style_or_df, height=height, use_container_width=True)
+
+# ---------- KPIs (Global exactos con df global) ----------
+def render_kpis_v2(df_global: pd.DataFrame, cons_hot: pd.DataFrame):
+    total_val_global = float((df_global["Current Value (USD)"]).sum(skipna=True))
+    unreal_global = float((df_global["Current Value (USD)"] - df_global["Total Cost (USD)"]).sum(skipna=True))
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(
+            f'<div class="kpi">**Total Value**<br/><span style="font-size:1.4rem">$ {total_val_global:,.2f}</span></div>',
+            unsafe_allow_html=True
+        )
+    with k2:
+        st.markdown(
+            f'<div class="kpi">**Unrealized P&L**<br/><span style="font-size:1.4rem">$ {unreal_global:,.2f}</span></div>',
+            unsafe_allow_html=True
+        )
+    with k3:
+        st.markdown(
+            f'<div class="kpi">**Positions (HOT)**<br/><span style="font-size:1.4rem">{len(cons_hot)}</span></div>',
+            unsafe_allow_html=True
+        )
+    fg_local = None
+    try:
+        fg_local = altme_fng()
+    except Exception:
+        pass
+    with k4:
+        if fg_local:
+            st.markdown(
+                f'<div class="kpi">**Fear & Greed**<br/><span style="font-size:1.2rem">{fg_local["value"]} · {fg_local["classification"]}</span></div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown('<div class="kpi">**Fear & Greed**<br/><span style="font-size:1.2rem">n/a</span></div>', unsafe_allow_html=True)
+
+# ---------- Wallets (Global + COLD/TREZOR visible) ----------
+def render_wallets_v2(df_global: pd.DataFrame):
+    st.subheader("Wallet breakdown (global + COLD/TREZOR)")
+    # Normaliza wallet
+    wnorm = df_global["Wallet"].fillna("").astype(str).str.strip()
+    dfw = df_global.copy()
+    dfw["wallet"] = wnorm.replace({"": "(Unassigned)"})
+
+    agg = (
+        dfw.groupby("wallet", as_index=False)["Current Value (USD)"]
+           .sum().sort_values("Current Value (USD)", ascending=False)
+    )
+    cold_aliases = {"TREZOR","HODL","VAULT","COLD"}
+    dfw["is_cold"] = dfw["wallet"].str.upper().isin(cold_aliases)
+
+    cold_total = float(dfw.loc[dfw["is_cold"], "Current Value (USD)"].sum())
+    hot_total  = float(dfw.loc[~dfw["is_cold"], "Current Value (USD)"].sum())
+    trezor_val = float(dfw.loc[dfw["wallet"].str.upper()=="TREZOR", "Current Value (USD)"].sum())
+
+    # KPIs mini
+    c1, c2, c3 = st.columns(3)
+    with c1: st.markdown(f'<div class="kpi">**HOT total**<br/><span style="font-size:1.2rem">$ {hot_total:,.2f}</span></div>', unsafe_allow_html=True)
+    with c2: st.markdown(f'<div class="kpi">**COLD total**<br/><span style="font-size:1.2rem">$ {cold_total:,.2f}</span></div>', unsafe_allow_html=True)
+    with c3: st.markdown(f'<div class="kpi">**TREZOR**<br/><span style="font-size:1.2rem">$ {trezor_val:,.2f}</span></div>', unsafe_allow_html=True)
+
+    # Tabla wallets
+    if len(agg) and agg["Current Value (USD)"].sum() > 0:
+        try:
+            import plotly.express as px
+            fig = px.pie(agg, values="Current Value (USD)", names="wallet", hole=0.55)
+            fig.update_layout(height=340, margin=dict(l=0,r=0,t=0,b=0), legend=dict(orientation="h", y=-0.08))
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.caption(f"No pude renderizar el gráfico: {e}")
+        # Tabla textual
+        t = agg.copy()
+        t["%"] = 100 * t["Current Value (USD)"] / t["Current Value (USD)"].sum()
+        _df_stretch(t.style.format({"Current Value (USD)":"${:,.2f}","%":"{:,.2f}%"}).hide(axis="index"), height=220)
+    else:
+        st.caption("Sin datos de wallets.")
+
+# ---------- Consolidated (HOT) + Indicators (Micro-API) ----------
+def render_hot_and_indicators_v2(cons_df: pd.DataFrame):
+    st.subheader("Consolidated — Trading (HOT only)")
+    tbl = cons_df[[
+        "Symbol","Quantity","Avg Cost (USD)","Used Price (USD)",
+        "Current Value (USD)","P&L (USD)","P&L %","% Portfolio"
+    ]].sort_values("Current Value (USD)", ascending=False)
+    style = tbl.style.format({
+        "Quantity":"{:.8f}","Avg Cost (USD)":"${:,.2f}","Used Price (USD)":"${:,.2f}",
+        "Current Value (USD)":"${:,.2f}","P&L (USD)":"${:,.2f}","P&L %":"{:.2f}%","% Portfolio":"{:.2f}%"
+    }).hide(axis="index")
+    _df_stretch(style, height=360)
+
+    st.markdown("---")
+    st.header("📊 Indicators (HOT • Micro-API)")
+
+    api_host = _get_env_or_default("API_HOST", "https://appestrategia.onrender.com")
+    api_key  = _get_env_or_default("API_KEY", "")
+
+    if not api_key:
+        st.info("Configura API_KEY en tu entorno (Render/Environment o variables de entorno locales).")
+        return
+
+    symbols = cons_df["Symbol"].dropna().astype(str).unique().tolist()
+    if not symbols:
+        st.caption("No hay símbolos HOT para consultar.")
+        return
+
+    try:
+        url = f"{api_host.rstrip('/')}/multi_indicators"
+        headers = {"x-api-key": api_key}
+        r = requests.get(url, headers=headers, params={"symbols": ",".join(symbols), "limit": 250}, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    except Exception as e:
+        st.error(f"No fue posible consultar indicadores: {e}")
+        return
+
+    if not data:
+        st.caption("Sin indicadores (Micro-API no respondió o sin datos).")
+        return
+
+    rows = []
+    for s in symbols:
+        d = data.get(s) or {}
+        rows.append({
+            "Symbol": s,
+            "Close": d.get("close"),
+            "SMA50": d.get("sma50"),
+            "SMA200": d.get("sma200"),
+            "ATR20": d.get("atr20"),
+            "↑SMA50": d.get("above_sma50"),
+            "↑SMA200": d.get("above_sma200"),
+        })
+    ind_tbl = pd.DataFrame(rows)
+    style2 = ind_tbl.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis="index")
+    _df_stretch(style2, height=260)
+
+# ---------- LLAMADAS (colócalas DESPUÉS de cargar df/df_hot/cons/cons_total) ----------
+try:
+    render_kpis_v2(df, cons)            # KPIs globales robustos
+    render_wallets_v2(df)               # Wallets + COLD/TREZOR
+    render_hot_and_indicators_v2(cons)  # HOT + Indicators
+except Exception as _err:
+    st.error(f"Patch UI V2 error: {_err}")
+# =========================================================================================
+# ============ CONSOLIDATED HOT (FIXED) + INDICATORS (FIXED) — DROP-IN ============
+import re, numpy as np, pandas as pd, requests, streamlit as st, os
+
+COLD_NAMES = {"TREZOR","HODL","VAULT","COLD","TREZOR/VAULT"}
+
+def _money(x):
+    s = str(x).strip()
+    if s in ("", "nan", "None", "—", "-", "null"): 
+        return np.nan
+    try:
+        s = re.sub(r"[^\d\.\-]", "", s)
+        return float(s) if s not in ("", ".", "-", "-.") else np.nan
+    except Exception:
+        return np.nan
+
+def _env(key: str, default: str="") -> str:
+    v = os.getenv(key)
+    return v if (v is not None and str(v).strip() != "") else default
+
+def rebuild_hot_fixed(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye HOT con reglas anti-outlier.
+       Used Price = Price si hay >0, si no Avg Cost, si no 0.
+       Corrige Avg/Total si están escalados por error (caso SKY)."""
     df = df_raw.copy()
 
     # columnas mínimas
-    needed = ["Symbol","Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)","Wallet"]
-    for c in needed:
+    need = ["Symbol","Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)","Wallet"]
+    for c in need:
         if c not in df.columns:
             df[c] = np.nan
 
@@ -508,42 +887,276 @@ def rebuild_hot_consolidation(df_raw: pd.DataFrame) -> pd.DataFrame:
     for c in ["Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)"]:
         df[c] = df[c].apply(_money)
 
-    # HOT = todo lo que NO esté marcado como COLD
-    wallet_upper = df["Wallet"].fillna("").astype(str).str.upper()
-    hot = df[~wallet_upper.isin(COLD_NAMES)].copy()
+    wallet_up = df["Wallet"].fillna("").astype(str).str.upper()
+    hot = df[~wallet_up.isin(COLD_NAMES)].copy()
 
-    # Used Price robusto (NO usa Total Cost)
-    used_price = hot["Price (USD)"]
-    used_price = used_price.where(used_price.notna(), hot["Avg Cost (USD)"])
-    used_price = used_price.fillna(0.0)
+    # used price
+    used = hot["Price (USD)"]
+    used = used.where((used.notna()) & (used > 0), hot["Avg Cost (USD)"])
+    used = used.where(used.notna(), 0.0)
+    hot["Used Price (USD)"] = used
 
-    hot["Used Price (USD)"] = used_price
-    hot["Current Value (USD)"] = (hot["Quantity"].fillna(0.0) * hot["Used Price (USD)"]).fillna(0.0)
+    # --- Anti-outlier por fila ---
+    # Si AvgCost >> max(Price, Used) (p.ej. >50x), tomamos como plausible el unit_cost real = TotalCost/Qty (si cuadra) o Price.
+    unit_decl = (hot["Total Cost (USD)"] / hot["Quantity"]).replace([np.inf, -np.inf], np.nan)
+    price_ref = hot["Price (USD)"].where(hot["Price (USD)"].notna() & (hot["Price (USD)"]>0), hot["Used Price (USD)"])
+    # corrige Avg Cost desorbitado
+    bad_avg = (hot["Avg Cost (USD)"].notna() & price_ref.notna() &
+               (hot["Avg Cost (USD)"] > 50*price_ref))
+    # nuevo avg = unit_decl si es razonable; si no, usa price_ref
+    new_avg = unit_decl.where(unit_decl.notna() & (unit_decl < 10*price_ref.fillna(1e9)), price_ref)
+    hot.loc[bad_avg, "Avg Cost (USD)"] = new_avg[bad_avg]
 
-    # groupby por símbolo
-    g = (
-        hot.groupby("Symbol", dropna=True, as_index=False)
-           .agg({
-               "Quantity": "sum",
-               "Total Cost (USD)": "sum",
-               "Used Price (USD)": "last",     # último precio usado
-               "Current Value (USD)": "sum"
-           })
-    )
+    # recalcula TotalCost si aún parece incoherente vs unit_decl
+    recomputed = (hot["Quantity"].fillna(0)*hot["Avg Cost (USD)"].fillna(0)).fillna(0)
+    too_far = hot["Total Cost (USD)"].notna() & (hot["Total Cost (USD)"] > 100*recomputed.clip(lower=1.0))
+    hot.loc[too_far | hot["Total Cost (USD)"].isna(), "Total Cost (USD)"] = recomputed
 
-    # avg cost, P&L, P&L%, %Portfolio
+    hot["Current Value (USD)"] = (hot["Quantity"].fillna(0)*hot["Used Price (USD)"].fillna(0)).fillna(0)
+
+    g = (hot.groupby("Symbol", dropna=True, as_index=False)
+            .agg({
+                "Quantity":"sum",
+                "Total Cost (USD)":"sum",
+                "Used Price (USD)":"last",
+                "Current Value (USD)":"sum",
+            }))
     g["Avg Cost (USD)"] = np.where(g["Quantity"]>0, g["Total Cost (USD)"]/g["Quantity"], np.nan)
     g["P&L (USD)"] = g["Current Value (USD)"] - g["Total Cost (USD)"]
     g["P&L %"] = np.where(g["Total Cost (USD)"]>0, 100*g["P&L (USD)"]/g["Total Cost (USD)"], 0.0)
     tot = float(g["Current Value (USD)"].sum())
     g["% Portfolio"] = np.where(tot>0, 100*g["Current Value (USD)"]/tot, 0.0)
+    return g
 
-    # sanity check: posibles “usos de precio” sospechosos
-    suspicious = g[(g["Avg Cost (USD)"].notna()) & (g["Used Price (USD)"] > 50 * g["Avg Cost (USD)"])]
-    if len(suspicious) > 0:
-        import streamlit as st
-        with st.expander("⚠️ Sanity check (posibles Used Price anómalos)"):
-            st.dataframe(suspicious, use_container_width=True)
+def _df_stretch(df_or_style, height: int=320):
+    try:
+        st.dataframe(df_or_style, height=height, width="stretch")
+    except TypeError:
+        st.dataframe(df_or_style, height=height, use_container_width=True)
+
+def _render_hot_fixed_and_indicators():
+    # localizar el DF base ya cargado en tu app
+    base = None
+    for name in ("df","df_positions","positions_df","data","data_df","df_all"):
+        if name in globals() and isinstance(globals()[name], pd.DataFrame):
+            base = globals()[name]
+            break
+    if base is None:
+        st.warning("No encontré el DataFrame base (df). Carga el CSV primero.")
+        return
+
+    cons_fixed = rebuild_hot_fixed(base)
+
+    st.subheader("Consolidated — Trading (HOT only) — fixed")
+    tbl = cons_fixed[[
+        "Symbol","Quantity","Avg Cost (USD)","Used Price (USD)",
+        "Current Value (USD)","P&L (USD)","P&L %","% Portfolio"
+    ]].sort_values("Current Value (USD)", ascending=False)
+    sty = tbl.style.format({
+        "Quantity":"{:.8f}","Avg Cost (USD)":"${:,.4f}","Used Price (USD)":"${:,.4f}",
+        "Current Value (USD)":"${:,.2f}","P&L (USD)":"${:,.2f}",
+        "P&L %":"{:.2f}%","% Portfolio":"{:.2f}%"
+    }).hide(axis="index")
+    _df_stretch(sty, height=360)
+
+    st.markdown("---")
+    st.header("📊 Indicators (HOT • Micro-API) — fixed")
+
+    api_host = _env("API_HOST", "https://appestrategia.onrender.com")
+    api_key  = _env("API_KEY", "")
+    if not api_key:
+        st.info("Define API_KEY (entorno local o Environment de Render) para consultar la Micro-API.")
+        return
+
+    symbols = cons_fixed["Symbol"].dropna().astype(str).unique().tolist()
+    if not symbols:
+        st.caption("No hay símbolos HOT para consultar.")
+        return
+
+    try:
+        url = f"{api_host.rstrip('/')}/multi_indicators"
+        headers = {"x-api-key": api_key}
+        r = requests.get(url, headers=headers, params={"symbols": ",".join(symbols), "limit": 250}, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    except Exception as e:
+        st.error(f"No fue posible consultar indicadores: {e}")
+        return
+
+    rows = []
+    for s in symbols:
+        d = data.get(s) or {}
+        rows.append({
+            "Symbol": s,
+            "Close": d.get("close"),
+            "SMA50": d.get("sma50"),
+            "SMA200": d.get("sma200"),
+            "ATR20": d.get("atr20"),
+            "↑SMA50": d.get("above_sma50"),
+            "↑SMA200": d.get("above_sma200"),
+        })
+    ind = pd.DataFrame(rows)
+    sty2 = ind.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis="index")
+    _df_stretch(sty2, height=260)
+
+# Llamada única del “fixed”
+try:
+    _render_hot_fixed_and_indicators()
+except Exception as e:
+    st.error(f"Fixed block error: {e}")
+# ================================================================================ 
+# ======================= HOT CONSOLIDATION — FIX BLOCK =======================
+import re, numpy as np, pandas as pd, streamlit as st, requests, os
+
+def _money_fix(x):
+    s = str(x).strip()
+    if s in ("", "nan", "None", "—", "-", "null"): 
+        return np.nan
+    try:
+        s = re.sub(r"[^\d\.\-]", "", s)
+        return float(s) if s not in ("", ".", "-", "-.") else np.nan
+    except Exception:
+        return np.nan
+
+def recompute_cons_hot(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye HOT por símbolo con reglas anti-outlier.
+       - Limpia números
+       - HOT = todo lo que NO esté en {TREZOR,HODL,VAULT,COLD}
+       - UsedPrice = Price si >0; si no AvgCost; si no 0
+       - TotalCost/AvgCost coherentes (Avg = Total/Qty)  ← clave SKY
+    """
+    COLD = {"TREZOR","HODL","VAULT","COLD","TREZOR/VAULT"}
+    df = df_in.copy()
+
+    # columnas mínimas
+    for c in ["Symbol","Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)","Wallet"]:
+        if c not in df.columns: df[c] = np.nan
+
+    # limpieza
+    for c in ["Quantity","Total Cost (USD)","Avg Cost (USD)","Price (USD)"]:
+        df[c] = df[c].apply(_money_fix)
+
+    # HOT
+    wallet_up = df["Wallet"].fillna("").astype(str).str.upper()
+    hot = df[~wallet_up.isin(COLD)].copy()
+
+    # Used price (row)
+    used = hot["Price (USD)"]
+    used = used.where((used.notna()) & (used > 0), hot["Avg Cost (USD)"])
+    used = used.fillna(0.0)
+    hot["Used Price (USD)"] = used
+
+    # === CLAVE: asegurar coherencia de COSTOS por fila ===
+    # si falta o es absurdo, imponemos: Avg = Total / Qty   y Total = Qty * Avg
+    qty = hot["Quantity"].fillna(0.0)
+    # si Total existe y Qty>0 → avg_row = Total/Qty
+    avg_row = np.where(qty>0, hot["Total Cost (USD)"].fillna(0.0)/qty, np.nan)
+    # si Avg está vacío o >50× Used, sustituimos por avg_row
+    bad_avg = (hot["Avg Cost (USD)"].isna()) | (
+        (hot["Avg Cost (USD)"].notna()) & (hot["Used Price (USD)"].notna()) &
+        (hot["Avg Cost (USD)"] > 50*hot["Used Price (USD)"].clip(lower=1e-12))
+    )
+    hot.loc[bad_avg, "Avg Cost (USD)"] = avg_row[bad_avg]
+
+    # Recalcular Total coherente (si falta o es absurdo frente a Qty*Avg)
+    total_row_expected = qty * hot["Avg Cost (USD)"].fillna(0.0)
+    bad_total = (hot["Total Cost (USD)"].isna()) | (
+        hot["Total Cost (USD)"] > 100 * total_row_expected.clip(lower=1.0)
+    )
+    hot.loc[bad_total, "Total Cost (USD)"] = total_row_expected[bad_total]
+
+    hot["Current Value (USD)"] = qty * hot["Used Price (USD)"]
+
+    # Consolidar por símbolo (sumas), y calcular Avg a partir de sumas
+    g = (hot.groupby("Symbol", dropna=True, as_index=False)
+             .agg({
+                 "Quantity":"sum",
+                 "Total Cost (USD)":"sum",
+                 "Current Value (USD)":"sum"
+             }))
+    g["Avg Cost (USD)"] = np.where(g["Quantity"]>0, g["Total Cost (USD)"]/g["Quantity"], np.nan)
+
+    # Para mostrar un Used Price por símbolo: último no nulo en HOT
+    last_used = (hot.sort_index()
+                   .dropna(subset=["Symbol"])
+                   .groupby("Symbol")["Used Price (USD)"].last()
+                   .reindex(g["Symbol"]).values)
+    g["Used Price (USD)"] = last_used
+
+    g["P&L (USD)"] = g["Current Value (USD)"] - g["Total Cost (USD)"]
+    g["P&L %"] = np.where(g["Total Cost (USD)"]>0, 100*g["P&L (USD)"]/g["Total Cost (USD)"], 0.0)
+    tot_val = float(g["Current Value (USD)"].sum())
+    g["% Portfolio"] = np.where(tot_val>0, 100*g["Current Value (USD)"]/tot_val, 0.0)
 
     return g
-# ===========================================================================#
+
+def render_hot_fixed_and_indicators():
+    # encuentra el DF base que ya cargas en la app
+    base = None
+    for name in ("df","df_positions","positions_df","data","data_df","df_all"):
+        if name in globals() and isinstance(globals()[name], pd.DataFrame):
+            base = globals()[name]; break
+    if base is None:
+        st.warning("Carga el CSV primero para ver el bloque FIXED."); return
+
+    cons_fixed = recompute_cons_hot(base)
+
+    st.markdown("### Consolidated — Trading (HOT only) · **FIXED**")
+    show = cons_fixed[["Symbol","Quantity","Avg Cost (USD)","Used Price (USD)",
+                       "Current Value (USD)","P&L (USD)","P&L %","% Portfolio"]]
+    try:
+        st.dataframe(
+            show.style.format({
+                "Quantity":"{:.8f}",
+                "Avg Cost (USD)":"${:,.4f}",
+                "Used Price (USD)":"${:,.4f}",
+                "Current Value (USD)":"${:,.2f}",
+                "P&L (USD)":"${:,.2f}",
+                "P&L %":"{:.2f}%",
+                "% Portfolio":"{:.2f}%"
+            }).hide(axis="index"),
+            width="stretch", height=360
+        )
+    except TypeError:
+        st.dataframe(show, use_container_width=True, height=360)
+
+    # ----- Indicators con API (usa secrets o entorno, lo que haya) -----
+    api_host = (st.secrets.get("API_HOST", None) if hasattr(st, "secrets") else None) or os.getenv("API_HOST","https://appestrategia.onrender.com")
+    api_key  = (st.secrets.get("API_KEY",  None) if hasattr(st, "secrets") else None) or os.getenv("API_KEY","")
+    st.markdown("---"); st.header("📊 Indicators (HOT • Micro-API) · **FIXED**")
+    if not api_key:
+        st.info("Define API_KEY (en secrets.toml o variables de entorno) para consultar indicadores.")
+        return
+
+    syms = cons_fixed["Symbol"].dropna().astype(str).unique().tolist()
+    try:
+        url = f"{api_host.rstrip('/')}/multi_indicators"
+        r = requests.get(url, headers={"x-api-key": api_key}, params={"symbols": ",".join(syms), "limit": 250}, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+    except Exception as e:
+        st.error(f"No fue posible consultar indicadores: {e}")
+        return
+
+    rows = []
+    for s in syms:
+        d = data.get(s) or {}
+        rows.append({"Symbol":s,"Close":d.get("close"),"SMA50":d.get("sma50"),
+                     "SMA200":d.get("sma200"),"ATR20":d.get("atr20"),
+                     "↑SMA50":d.get("above_sma50"),"↑SMA200":d.get("above_sma200")})
+    ind = pd.DataFrame(rows)
+    try:
+        st.dataframe(
+            ind.style.format({"Close":"${:,.2f}","SMA50":"${:,.2f}","SMA200":"${:,.2f}","ATR20":"${:,.2f}"}).hide(axis="index"),
+            width="stretch", height=260
+        )
+    except TypeError:
+        st.dataframe(ind, use_container_width=True, height=260)
+
+# Ejecuta el bloque FIXED (no rompe tu UI actual; añade una sección corregida)
+try:
+    render_hot_fixed_and_indicators()
+except Exception as _e:
+    st.error(f"FIX block error: {_e}")
+# ============================================================================ 
