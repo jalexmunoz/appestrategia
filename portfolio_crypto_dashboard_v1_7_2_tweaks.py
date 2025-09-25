@@ -183,23 +183,54 @@ with left:
 with right:
     st.subheader("Wallet breakdown")
     w = df.groupby("Wallet", as_index=False)["Current Value (USD)"].sum().rename(columns={"Current Value (USD)":"Value (USD)"})
-    w = w[w["Wallet"].astype(str).str.len()>0]
-    if not w.empty and total_val>0:
-        w["% Portfolio"] = 100*w["Value (USD)"]/total_val
+    w = w[w["Wallet"].astype(str).str.len() > 0]
+    if not w.empty and total_val > 0:
+        w["% Portfolio"] = 100 * w["Value (USD)"] / total_val
         w_sorted = w.sort_values("Value (USD)", ascending=False)
+
+        # etiquetas cortas y agrupar pequeñas en Other
+        w_sorted["Wallet"] = w_sorted["Wallet"].astype(str).str.slice(0, 12)
         if len(w_sorted) > 6:
             top = w_sorted.head(5).copy()
-            other = pd.DataFrame({"Wallet":["Other"], "Value (USD)":[w_sorted["Value (USD)"].iloc[5:].sum()]})
-            w_plot = pd.concat([top, other], ignore_index=True)
-            w_plot["% Portfolio"] = 100*w_plot["Value (USD)"]/total_val
+            other_val = w_sorted["Value (USD)"].iloc[5:].sum()
+            if other_val > 0:
+                other = pd.DataFrame({"Wallet": ["Other"], "Value (USD)":[other_val]})
+                w_plot = pd.concat([top, other], ignore_index=True)
+            else:
+                w_plot = top
         else:
             w_plot = w_sorted.copy()
-        pie = px.pie(w_plot, names="Wallet", values="Value (USD)", hole=0.45, color_discrete_sequence=px.colors.qualitative.Safe)
-        pie.update_traces(textposition='inside', texttemplate="%{label}<br>%{percent:.1%}")
-        pie.update_layout(paper_bgcolor="#0B1220", plot_bgcolor="#0B1220", font_color="#e5e7eb")
-        st.plotly_chart(pie, use_container_width=True)
+
+        w_plot["% Portfolio"] = 100 * w_plot["Value (USD)"] / total_val
+
+        pie = px.pie(
+            w_plot, names="Wallet", values="Value (USD)", hole=0.45,
+            color_discrete_sequence=px.colors.qualitative.Safe
+        )
+        pie.update_traces(
+            textposition="inside",
+            texttemplate="%{label}<br>%{percent:.1%}",
+            insidetextfont_size=12,
+            hovertemplate="%{label}: $%{value:,.0f}<extra></extra>"
+        )
+        pie.update_layout(
+            paper_bgcolor="#0B1220", plot_bgcolor="#0B1220", font_color="#e5e7eb",
+            margin=dict(l=8, r=8, t=8, b=32),
+            height=320,
+            legend=dict(
+                orientation="h", yanchor="bottom", y=-0.22, xanchor="center", x=0.5,
+                font=dict(size=11), title=None
+            ),
+            uniformtext_minsize=10, uniformtext_mode="hide"
+        )
+        st.plotly_chart(
+            pie,
+            use_container_width=True,
+            config={"displayModeBar": False, "responsive": True}
+        )
     else:
         st.caption("No hay información de Wallet en el CSV.")
+
 
 # ---- BOTTOM: Near / Movers ----
 b1, b2 = st.columns(2)
