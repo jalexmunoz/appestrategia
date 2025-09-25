@@ -167,7 +167,7 @@ cons["Status"] = cons["P&L %"].apply(chip_status)
 cons["Signals"] = cons.apply(lambda r: chip_signals(r, band), axis=1)
 
 # ---- TOP: Consolidated (wide) + Wallet donut ----
-left, right = st.columns([7,5])
+left, right = st.columns([8,4])
 
 with left:
     st.subheader("Consolidated")
