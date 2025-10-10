@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 # ============================================================
 # 🔹 CONFIGURACIÓN
 # ============================================================
-BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
+BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.us")
 API_KEY = os.getenv("API_KEY", "alex-crypto-123")
 
 logging.basicConfig(level=logging.INFO)
@@ -107,3 +107,4 @@ async def multi_indicators(symbols: str, limit: int = 250, x_api_key: str | None
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
