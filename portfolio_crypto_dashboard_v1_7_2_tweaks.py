@@ -1,5 +1,6 @@
 
 import os, json, time, requests, math
+from io import StringIO
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -179,48 +180,122 @@ with left:
         "Current Value (USD)":"${:,.2f}","P&L (USD)":"${:,.2f}","P&L %":"{:.2f}%","% Portfolio":"{:.2f}%"
     }).hide(axis='index').to_html(escape=False)
     st.markdown(html, unsafe_allow_html=True)
+    if not show.empty:
+        cons_csv = StringIO()
+        show.to_csv(cons_csv, index=False)
+        st.download_button(
+            "Download consolidated.csv",
+            data=cons_csv.getvalue(),
+            file_name="consolidated.csv",
+            mime="text/csv"
+        )
 
 with right:
     st.subheader("Wallet breakdown")
+    compact_legend = st.checkbox("Compact legend", value=False)
     w = df.groupby("Wallet", as_index=False)["Current Value (USD)"].sum().rename(columns={"Current Value (USD)":"Value (USD)"})
     w = w[w["Wallet"].astype(str).str.len() > 0]
     if not w.empty and total_val > 0:
-        w["% Portfolio"] = 100 * w["Value (USD)"] / total_val
-        w_sorted = w.sort_values("Value (USD)", ascending=False)
+        w_totals = (
+            w.groupby("Wallet", as_index=False)["Value (USD)"]
+            .sum()
+            .sort_values("Value (USD)", ascending=False)
+        )
+        w_totals["Full Label"] = w_totals["Wallet"].astype(str)
 
-        # etiquetas cortas y agrupar pequeñas en Other
-        w_sorted["Wallet"] = w_sorted["Wallet"].astype(str).str.slice(0, 12)
-        if len(w_sorted) > 6:
-            top = w_sorted.head(5).copy()
-            other_val = w_sorted["Value (USD)"].iloc[5:].sum()
+        if len(w_totals) > 6:
+            top = w_totals.head(5).copy()
+            other_slice = w_totals.iloc[5:]
+            other_val = other_slice["Value (USD)"].sum()
             if other_val > 0:
-                other = pd.DataFrame({"Wallet": ["Other"], "Value (USD)":[other_val]})
+                other = pd.DataFrame({
+                    "Wallet": ["Other"],
+                    "Value (USD)": [other_val],
+                    "Full Label": [", ".join(other_slice["Full Label"].tolist()) or "Other"],
+                })
                 w_plot = pd.concat([top, other], ignore_index=True)
             else:
                 w_plot = top
         else:
-            w_plot = w_sorted.copy()
+            w_plot = w_totals.copy()
 
+        def shorten_wallet(name: str) -> str:
+            name = str(name).strip()
+            return name if len(name) <= 12 else name[:11].rstrip() + "…"
+
+        display_labels = []
+        for wallet, full_label in zip(w_plot["Wallet"], w_plot["Full Label"]):
+            if wallet == "Other":
+                display_labels.append("Other")
+            else:
+                display_labels.append(shorten_wallet(full_label))
+
+        # Ensure truncated labels remain unique so the legend stays readable
+        superscripts = {"0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹"}
+
+        def add_suffix(label: str, count: int) -> str:
+            suffix = "".join(superscripts[d] for d in str(count))
+            if label.endswith("…"):
+                base = label[:-1]
+            else:
+                base = label
+            max_len = 12 - len(suffix)
+            base = base[:max_len].rstrip()
+            return f"{base}{suffix}"
+
+        seen = {}
+        unique_labels = []
+        for lbl in display_labels:
+            seen[lbl] = seen.get(lbl, 0) + 1
+            if seen[lbl] == 1:
+                unique_labels.append(lbl)
+            else:
+                unique_labels.append(add_suffix(lbl, seen[lbl]))
+
+        w_plot["Display Label"] = unique_labels
         w_plot["% Portfolio"] = 100 * w_plot["Value (USD)"] / total_val
 
         pie = px.pie(
-            w_plot, names="Wallet", values="Value (USD)", hole=0.45,
+            w_plot,
+            names="Display Label",
+            values="Value (USD)",
+            hole=0.45,
+            custom_data=["Full Label", "% Portfolio"],
             color_discrete_sequence=px.colors.qualitative.Safe
         )
         pie.update_traces(
             textposition="inside",
-            texttemplate="%{label}<br>%{percent:.1%}",
+            texttemplate="%{label}<br>%{customdata[1]:.1f}%",
             insidetextfont_size=12,
-            hovertemplate="%{label}: $%{value:,.0f}<extra></extra>"
+            hovertemplate="%{customdata[0]}: $%{value:,.0f}<extra></extra>"
         )
+        legend_style = (
+            dict(
+                orientation="v",
+                yanchor="middle",
+                y=0.5,
+                xanchor="left",
+                x=1.02,
+                font=dict(size=10),
+                title=None,
+            )
+            if compact_legend
+            else dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.15,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=11),
+                title=None,
+            )
+        )
+
         pie.update_layout(
             paper_bgcolor="#0B1220", plot_bgcolor="#0B1220", font_color="#e5e7eb",
-            margin=dict(l=8, r=8, t=8, b=32),
+            margin=dict(l=0, r=0, t=24, b=80),
             height=320,
-            legend=dict(
-                orientation="h", yanchor="bottom", y=-0.22, xanchor="center", x=0.5,
-                font=dict(size=11), title=None
-            ),
+            legend=legend_style,
             uniformtext_minsize=10, uniformtext_mode="hide"
         )
         st.plotly_chart(
@@ -253,6 +328,14 @@ with b1:
                 "Stop (nearest)":"${:,.2f}","Δ to Stop %":"{:+.2f}%"
             }).hide(axis='index'),
             use_container_width=True, height=280
+        )
+        table_csv = StringIO()
+        table.to_csv(table_csv, index=False)
+        st.download_button(
+            "Download near_targets.csv",
+            data=table_csv.getvalue(),
+            file_name="near_targets.csv",
+            mime="text/csv"
         )
     else:
         st.caption("Sin activos cerca de targets/stops.")
